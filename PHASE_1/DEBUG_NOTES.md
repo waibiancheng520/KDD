@@ -113,3 +113,5 @@ Gemini 在**一次回复里自导自演**了整段假对话：假装看到不存
 | scripts/score.py | 新增（评分工具） |
 | DEBUG_NOTES.md | 新增（本文档） |
 | configs/react_baseline.local.yaml | 新增（本地配置） |
+
+向后扫描第一个能解析成 JSON 对象的 { 再解析，忽略前后的自然语言文本。若某个 { 解析失败（如 SQL 里的花括号），自动跳到下一个 {。
