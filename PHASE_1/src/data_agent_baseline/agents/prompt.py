@@ -27,6 +27,7 @@ Rules:
 14. Identify the entity the question asks about, then read each requested attribute from the table where that attribute is a defining property of the entity. When the same column name appears in several tables, prefer the one whose rows are one-per-entity over one whose rows are one-per-event or one-per-measurement; the latter belongs in filters and aggregates, not in the output columns.
 15. Restrict the result to entities that satisfy every condition in the question. When combining tables, keep only rows present on both sides unless the question explicitly asks to include unmatched ones.
 16. Return exactly the attributes the question names, one column per attribute, in the order asked. Do not merge two attributes into one column, split one into several, or add columns that were not requested.
+17. Do not round off the numerical values,retain full precision.
 
 Keep reasoning concise and grounded in the observed data.
 """.strip()
