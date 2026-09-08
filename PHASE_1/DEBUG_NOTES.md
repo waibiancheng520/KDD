@@ -19,6 +19,7 @@
 | 8 | 系统性找瓶颈 | 派 2 个 subagent 深挖代码与失败 trace + 跨版本方差分析 | 定位 3 个机制缺陷 |
 | 9 | 落地机制修复 | 文档分页 + 头尾截断 + 强制收尾轮 + 兜底打捞 + 反重复硬拒绝 + 问题重述 | **v14 = 70.8%，未产出归零** |
 | 10 | 两题怎么调都错 | 用数据核对，确认**文档与 gold 互相矛盾** | 排除并建立双口径评分 |
+| 11 | observation 中的失败和成功结果都进入历史，答案只靠 prompt 约束来源 | observation 分级 + provenance + 旧历史压缩 + `evidence_step` 硬校验 | 5 个单测通过；**尚未运行 benchmark，不能推断分数变化** |
 
 ---
 
@@ -235,21 +236,140 @@ v14 剩余 14 个错题，按模式归类：
 
 ---
 
+## 八、Observation 分级、证据溯源与旧历史压缩（2026-09-08）
+
+### 8.1 遇到的问题
+
+原来的实现虽然为每个 `StepRecord` 保存了 `ok`，但这个字段主要用于 trace 和日志，没有形成真正的**证据信任边界**：
+
+1. 成功 observation、SQL/工具失败、JSON 解析错误都按时间顺序重新放进下一轮上下文。旧 observation 只做字符截断，没有按可信度分区。
+2. `answer` 只校验表格形状，不校验答案来自哪一步。"答案必须来自工具 observation"只是 prompt 规则，模型仍可能引用失败结果、记错旧值或直接编值。
+3. `_salvage_answer` 会倒查最近的表格型 observation，但没有显式要求该步骤是可信证据。
+4. 所有旧步骤分别回放，错误虽被标成 `ok: false`，仍会持续占据上下文并影响后续推理。
+
+这不是跨任务污染：每个任务仍创建新的 `AgentRuntimeState`。问题发生在**同一个任务内部**——早期错误和噪声会跟随后续步骤，产生路径依赖。
+
+### 8.2 本次实现
+
+#### A. observation 显式分级
+
+`StepRecord` 新增：
+
+- `evidence_status`: `verified | error | terminal`
+- `provenance_id`: 例如 `step:3:tool:query_files`
+
+当前 `verified` 的准确含义是：**工具调用成功，且 observation 自身为 `ok: true`**。它证明数据来自真实工具调用，不证明 SQL 的业务语义一定正确。
+
+#### B. 旧历史改成结构化工作记忆
+
+最近 3 步仍完整回放，便于模型修复刚发生的错误；更早的步骤不再逐条组成完整对话，而是由运行时确定性地压缩为两个区域：
+
+```text
+VERIFIED EVIDENCE
+- [step:N:tool:X] input=... result=...
+
+UNRESOLVED ISSUES / FAILED ATTEMPTS
+- [step:M:tool:Y] FAILED (not evidence): ...
+```
+
+边界参数：
+
+- 最多保留最近 8 条旧的 verified evidence；
+- 最多保留最近 5 条旧的失败/未解决项；
+- 每条 evidence 最多约 1800 字符，并采用头尾保留；
+- 失败项会留给模型纠错，但明确标注为 `not evidence`，不能支持最终答案。
+
+这里的压缩不是让模型再总结一次，而是运行时直接从真实 `StepRecord` 生成，因此不会在总结阶段引入新的模型幻觉。
+
+#### C. 最终答案必须声明来源
+
+`answer` 工具新增必填字段：
+
+```json
+{
+  "columns": ["value"],
+  "rows": [[42]],
+  "evidence_step": 3
+}
+```
+
+运行时在执行 `answer` 前校验：
+
+1. `evidence_step` 必须存在，且必须是先前步骤；
+2. 该步骤必须同时满足 `step.ok == true`、`observation.ok == true`、`evidence_status == verified`；
+3. 不能把之前的 `answer` 步骤当成数据证据；
+4. 对 `query_files` 等结构化 `{columns, rows}` 结果，答案必须与引用表格**完全一致**；
+5. 对 Python/文档工具的非结构化输出，答案列名和每个单元格值都必须能在被引用 observation 中找到。
+
+校验失败时不会终止任务，而是写入新的 `ok: false` observation：`UNSUPPORTED ANSWER: ...`，让 Agent 在剩余步骤中重新打印完整结果并再次提交。
+
+#### D. 收尾路径也受相同约束
+
+- 强制收尾轮必须提供合法 `evidence_step`；
+- `_salvage_answer` 只允许从 `ok: true + verified` 的结构化表格中打捞；
+- 失败 observation、解析错误和先前提交结果全部不能被打捞为答案。
+
+### 8.3 实现时额外遇到的问题
+
+| 问题 | 处理 |
+|---|---|
+| 拒绝不可信答案时 `tool_result=None`，原日志会误写成 `[refused: repeat]` | 单独输出 `[rejected: unsupported evidence]`，避免把证据拒绝与循环拒绝混为一谈 |
+| 第一版结构化表格不匹配后仍会退化到字符串包含检查 | 改成只要来源包含结构化 `columns/rows`，就必须整表完全相等，不允许降级绕过 |
+| 只检查 `StepRecord.ok` 可能接受内部状态不一致的记录 | 同时检查 `step.ok`、`observation.ok` 和 `evidence_status` 三个条件 |
+| 项目虚拟环境没有 `pytest`、`ruff` | 执行 `uv sync --extra dev` 安装开发依赖；未运行 baseline |
+| 根目录与 `PHASE_1/.gitignore` 都忽略 `tests/` | 只对白名单测试 `PHASE_1/tests/test_react_evidence.py` 解除忽略，其他本地测试仍保持忽略 |
+
+### 8.4 测试结果
+
+新增 `tests/test_react_evidence.py`，覆盖：
+
+1. 接受来自成功 observation 的完全一致结构化表格；
+2. 拒绝失败步骤和内容不一致的表格；
+3. 即使 `StepRecord.ok=true`，只要 `observation.ok=false` 仍拒绝；
+4. 压缩记忆会把 verified evidence 与 failed attempt 分区；
+5. Agent 收到无证据答案时不会错误终止任务。
+
+验证命令及结果：
+
+```text
+uv run pytest -q                 -> 5 passed
+uv run ruff check src tests      -> All checks passed
+uv run python -m compileall ...  -> passed
+git diff --check                 -> passed
+```
+
+**没有运行 baseline，也没有产生新的准确率/F1 数据。** 这次只能确认机制按设计工作，真实收益与误伤需要另开 run_id 做对照实验。
+
+### 8.5 已知边界与后续观察点
+
+1. **`ok: true` 不等于语义正确。** SQL 可以成功执行但选错表、列、过滤条件或聚合口径；本次只能阻止失败结果和无来源值进入答案。
+2. 当前答案只支持一个 `evidence_step`。如果最终表来自多条 observation，Agent 必须再运行一次工具，把完整最终表打印在同一个成功步骤中。
+3. 结构化结果采用严格类型和值比较，例如数值 `42` 与字符串 `"42"` 会被视为不同。这样更安全，但可能拒绝只发生表示类型变化的正确答案。
+4. 非结构化 Python/文档输出采用"列名和每个值都出现"的检查，强于无校验，但弱于整表结构匹配；短值（如 `1`）仍可能偶然命中。
+5. "UNRESOLVED ISSUES"目前实质上是旧的失败尝试集合，不会自动判断某个错误是否已被后续查询真正解决。
+6. 旧记忆有条数和字符预算；特别早且不在最近 8 条内的 verified evidence 会从模型可见上下文中退出，但仍保留在 `state.steps` 中供运行时验证。
+
+下一次 benchmark 应重点统计：证据拒绝次数、因严格类型匹配导致的拒绝、被迫重新打印整表所增加的步数、未产出率，以及准确率/F1 是否相对 v14 改善。
+
+---
+
 ## 附录 A：改动文件清单
 
 | 文件 | 本次改动 |
 |---|---|
-| `agents/react.py` | 解析器容忍前言；反重复硬拒绝；强制收尾轮 `_forced_answer_turn`；兜底打捞 `_salvage_answer`；观察预算 9000/1200 |
-| `agents/prompt.py` | 规则重编号 0-13；最小投影/不拼接/全精度/自检；头+尾截断；warning 外提；问题重述；`TEXT_MODE_FORMAT_RULES` 按模式条件注入 |
+| `agents/react.py` | 解析器容忍前言；反重复硬拒绝；强制收尾轮；verified/error 分区记忆；`evidence_step` 校验；不可信答案硬拒绝；打捞仅限 verified 表格 |
+| `agents/prompt.py` | 规则重编号 0-13；最小投影/不拼接/全精度/自检；头+尾截断；warning 外提；问题重述；要求答案引用成功 observation |
 | `agents/model.py` | function calling 支持（默认关，可回退）；tool_call → 规范 JSON；端点不支持自动降级 |
 | `tools/profile.py` | **新增**：一次画像整个 context |
 | `tools/duckdb_files.py` | **新增**：DuckDB 跨源 SQL（csv+json+sqlite） |
-| `tools/registry.py` | 注册新工具；JSON Schema；`read_doc/read_json` 加 `offset`；`DOC_WINDOW_CHARS=8000` |
+| `tools/registry.py` | 注册新工具；JSON Schema；`read_doc/read_json` 加 `offset`；`DOC_WINDOW_CHARS=8000`；`answer` 新增必填 `evidence_step` |
 | `tools/filesystem.py` | `_window()` 分页读取，返回 `next_offset` |
 | `run/runner.py` | 接入排除清单 `load_excluded_task_ids()` |
 | `config.py` | 新增 `agent.native_tools` 开关 |
 | `configs/excluded_tasks.json` | **新增**：排除清单（带证据） |
 | `scripts/score.py` | 双口径报告 |
+| `agents/runtime.py` | `StepRecord` 新增 `evidence_status` 与 `provenance_id` |
+| `tests/test_react_evidence.py` | 新增 5 个证据信任边界测试 |
 
 ## 附录 B：调优方法论
 

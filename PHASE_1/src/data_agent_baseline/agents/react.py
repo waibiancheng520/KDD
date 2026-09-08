@@ -21,7 +21,12 @@ _FULL_OBSERVATION_STEPS = 3
 # Must be >= tools.registry.DOC_WINDOW_CHARS, or a document window the model
 # explicitly asked for is cut off before it ever reaches the model.
 _RECENT_OBSERVATION_CHARS = 9000
-_OLD_OBSERVATION_CHARS = 1200
+# A bounded, runtime-generated memory replaces the full dialogue for old steps.
+# It keeps successful evidence separate from failures so errors cannot masquerade
+# as facts merely because they appeared earlier in the conversation.
+_MEMORY_ITEM_CHARS = 1800
+_MEMORY_MAX_VERIFIED = 8
+_MEMORY_MAX_ISSUES = 5
 # Refuse to execute an action once it has already been issued this many times.
 _REPEAT_REFUSE_AFTER = 2
 
@@ -45,6 +50,111 @@ def _count_trailing_repeats(steps: list, signature: str) -> int:
         else:
             break
     return repeats
+
+
+def _short_json(value: object, max_chars: int = _MEMORY_ITEM_CHARS) -> str:
+    rendered = json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str)
+    if len(rendered) <= max_chars:
+        return rendered
+    head = max_chars * 2 // 3
+    tail = max_chars - head
+    return rendered[:head] + "...[middle omitted]..." + rendered[-tail:]
+
+
+def _build_compacted_memory(steps: list[StepRecord]) -> str:
+    """Build bounded memory whose facts come only from successful tool calls."""
+    verified: list[str] = []
+    issues: list[str] = []
+    for step in steps:
+        provenance = step.provenance_id or f"step:{step.step_index}:tool:{step.action}"
+        if (
+            step.ok
+            and step.observation.get("ok") is True
+            and step.evidence_status == "verified"
+            and step.action != "answer"
+        ):
+            content = step.observation.get("content")
+            verified.append(
+                f"- [{provenance}] input={_short_json(step.action_input, 500)} "
+                f"result={_short_json(content)}"
+            )
+        elif step.evidence_status == "error":
+            error = step.observation.get("error", step.observation.get("content"))
+            issues.append(
+                f"- [step:{step.step_index}:tool:{step.action}] FAILED (not evidence): "
+                f"{_short_json(error, 700)}"
+            )
+
+    verified = verified[-_MEMORY_MAX_VERIFIED:]
+    issues = issues[-_MEMORY_MAX_ISSUES:]
+    verified_text = "\n".join(verified) if verified else "- (none)"
+    issue_text = "\n".join(issues) if issues else "- (none)"
+    return (
+        "Runtime-generated working memory for older steps. Treat only VERIFIED EVIDENCE as facts.\n"
+        "VERIFIED EVIDENCE:\n"
+        f"{verified_text}\n"
+        "UNRESOLVED ISSUES / FAILED ATTEMPTS:\n"
+        f"{issue_text}\n"
+        "Failed attempts explain what remains unresolved; they never support an answer."
+    )
+
+
+def _answer_evidence_error(
+    action_input: dict[str, object], steps: list[StepRecord]
+) -> str | None:
+    """Return why an answer is unsupported, or None when its provenance is valid."""
+    evidence_step = action_input.get("evidence_step")
+    if not isinstance(evidence_step, int) or isinstance(evidence_step, bool):
+        return "answer.evidence_step must name one successful prior tool step."
+    source = next((step for step in steps if step.step_index == evidence_step), None)
+    if source is None:
+        return f"Evidence step {evidence_step} does not exist."
+    if (
+        not source.ok
+        or source.observation.get("ok") is not True
+        or source.evidence_status != "verified"
+        or source.action == "answer"
+    ):
+        return f"Step {evidence_step} is not verified evidence."
+
+    columns = action_input.get("columns")
+    rows = action_input.get("rows")
+    if not isinstance(columns, list) or not isinstance(rows, list):
+        return "Answer columns and rows must be lists."
+    content = source.observation.get("content")
+    if isinstance(content, dict):
+        source_columns = content.get("columns")
+        source_rows = content.get("rows")
+        if isinstance(source_columns, list) and isinstance(source_rows, list):
+            if source_columns == columns and source_rows == rows:
+                return None
+            return (
+                f"Answer table does not exactly match structured evidence step {evidence_step}."
+            )
+
+    # Python/document tools may return a rendered table instead of structured rows.
+    # In that case every submitted cell must still occur in the cited observation.
+    rendered = json.dumps(content, ensure_ascii=False, default=str)
+    for column in columns:
+        if not isinstance(column, str) or column not in rendered:
+            return (
+                f"Column {column!r} is absent from cited evidence step {evidence_step}. "
+                "Print the complete final table before answering."
+            )
+    for row in rows:
+        if not isinstance(row, list):
+            return "Each answer row must be a list."
+        for cell in row:
+            if cell is None:
+                candidates = ("null", "None", "<NA>")
+            else:
+                candidates = (str(cell), json.dumps(cell, ensure_ascii=False, default=str))
+            if not any(candidate in rendered for candidate in candidates):
+                return (
+                    f"Value {cell!r} is absent from cited evidence step {evidence_step}. "
+                    "Run a tool that prints the complete final table, then cite that step."
+                )
+    return None
 
 
 @dataclass(frozen=True, slots=True)
@@ -135,10 +245,15 @@ class ReActAgent:
         )
         messages = [ModelMessage(role="system", content=system_content)]
         messages.append(ModelMessage(role="user", content=build_task_prompt(task)))
-        # Older observations are heavily truncated: replaying every full tool dump makes
-        # the input grow quadratically, which blows the model's per-minute token quota.
-        last_full_index = len(state.steps) - _FULL_OBSERVATION_STEPS
-        for step in state.steps:
+        # Replace old dialogue with one bounded, typed memory block. Recent steps stay
+        # verbatim so the model can repair the latest failure without losing detail.
+        old_steps = state.steps[:-_FULL_OBSERVATION_STEPS]
+        recent_steps = state.steps[-_FULL_OBSERVATION_STEPS:]
+        if old_steps:
+            messages.append(
+                ModelMessage(role="user", content=_build_compacted_memory(old_steps))
+            )
+        for step in recent_steps:
             # Feed back ONLY the single action the model actually took, not its full
             # raw output. The raw output may contain hallucinated "observations" the
             # model wrote itself; replaying those would let it trust its own fabricated
@@ -162,11 +277,7 @@ class ReActAgent:
                         step.observation,
                         step_index=step.step_index,
                         max_steps=self.config.max_steps,
-                        max_chars=(
-                            _RECENT_OBSERVATION_CHARS
-                            if step.step_index > last_full_index
-                            else _OLD_OBSERVATION_CHARS
-                        ),
+                        max_chars=_RECENT_OBSERVATION_CHARS,
                         question=task.question if step.step_index == len(state.steps) else None,
                     ),
                 )
@@ -185,7 +296,8 @@ class ReActAgent:
                     "nothing else, using the best result table you can assemble from observations you "
                     "have already seen. Any other action will be discarded. Follow the answer rules: "
                     "only the columns the question asks for, one source column per output column, and "
-                    "full numeric precision."
+                    "full numeric precision. You MUST include `evidence_step`, citing the successful "
+                    "observation that printed the complete table."
                 ),
             )
         )
@@ -198,6 +310,10 @@ class ReActAgent:
             raw_response = self.model.complete(messages, answer_only)
             model_step = parse_model_step(raw_response)
             if model_step.action != "answer":
+                return
+            evidence_error = _answer_evidence_error(model_step.action_input, state.steps)
+            if evidence_error is not None:
+                print(f"[收尾] 强制提交证据不足: {evidence_error}", file=sys.stderr, flush=True)
                 return
             tool_result = self.tools.execute(task, "answer", model_step.action_input)
         except Exception as exc:  # a failed rescue must not mask the original outcome
@@ -214,18 +330,21 @@ class ReActAgent:
                     raw_response=raw_response,
                     observation={"ok": True, "tool": "answer", "content": tool_result.content},
                     ok=True,
+                    evidence_status="terminal",
+                    provenance_id=f"step:{len(state.steps) + 1}:tool:answer",
                 )
             )
             print("[收尾] 强制提交成功", file=sys.stderr, flush=True)
 
     def _salvage_answer(self, state: AgentRuntimeState) -> None:
-        """Last resort: submit the most recent tabular observation as the answer.
+        """Last resort: submit the most recent verified tabular observation.
 
-        A wrong table still scores partial row-level F1; submitting nothing is a
-        guaranteed zero, and runs exist where the gold table was printed by the
-        final step and then discarded.
+        Failed observations are deliberately ineligible. This preserves the evidence
+        boundary even when the model runs out of steps before calling `answer`.
         """
         for step in reversed(state.steps):
+            if not step.ok or step.evidence_status != "verified" or step.action == "answer":
+                continue
             content = (step.observation or {}).get("content")
             if not isinstance(content, dict):
                 continue
@@ -280,13 +399,32 @@ class ReActAgent:
                         ),
                     }
                 else:
-                    tool_result = self.tools.execute(task, model_step.action, model_step.action_input)
-                    observation = {
-                        "ok": tool_result.ok,
-                        "tool": model_step.action,
-                        "content": tool_result.content,
-                    }
-                    if not tool_result.is_terminal and prior_repeats >= 1:
+                    evidence_error = (
+                        _answer_evidence_error(model_step.action_input, state.steps)
+                        if model_step.action == "answer"
+                        else None
+                    )
+                    if evidence_error is not None:
+                        tool_result = None
+                        observation = {
+                            "ok": False,
+                            "tool": "answer",
+                            "error": "UNSUPPORTED ANSWER: " + evidence_error,
+                        }
+                    else:
+                        tool_result = self.tools.execute(
+                            task, model_step.action, model_step.action_input
+                        )
+                        observation = {
+                            "ok": tool_result.ok,
+                            "tool": model_step.action,
+                            "content": tool_result.content,
+                        }
+                    if (
+                        tool_result is not None
+                        and not tool_result.is_terminal
+                        and prior_repeats >= 1
+                    ):
                         observation["repeat_warning"] = (
                             f"You have issued this SAME action {prior_repeats + 1} times in a row and are "
                             "stuck in a loop. Do NOT repeat it again. Take a DIFFERENT action, or call the "
@@ -301,11 +439,25 @@ class ReActAgent:
                     raw_response=raw_response,
                     observation=observation,
                     ok=bool(tool_result and tool_result.ok),
+                    evidence_status=(
+                        "terminal"
+                        if tool_result is not None and tool_result.is_terminal
+                        else "verified"
+                        if tool_result is not None and tool_result.ok
+                        else "error"
+                    ),
+                    provenance_id=f"step:{step_index}:tool:{model_step.action}",
                 )
                 state.steps.append(step_record)
+                if tool_result is not None:
+                    status_suffix = ""
+                elif observation.get("tool") == "answer":
+                    status_suffix = " [rejected: unsupported evidence]"
+                else:
+                    status_suffix = " [refused: repeat]"
                 print(
                     f"    -> {model_step.action} ok={bool(tool_result and tool_result.ok)}"
-                    + ("" if tool_result else " [refused: repeat]"),
+                    + status_suffix,
                     file=sys.stderr,
                     flush=True,
                 )
@@ -326,6 +478,8 @@ class ReActAgent:
                         raw_response=raw_response,
                         observation=observation,
                         ok=False,
+                        evidence_status="error",
+                        provenance_id=f"step:{step_index}:tool:__error__",
                     )
                 )
 

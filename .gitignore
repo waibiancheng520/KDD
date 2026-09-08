@@ -26,6 +26,8 @@ htmlcov/
 data/
 docs/
 tests/
+!PHASE_1/tests/
+!PHASE_1/tests/test_react_evidence.py
 evaluation/
 artifacts/*
 !artifacts/.gitkeep

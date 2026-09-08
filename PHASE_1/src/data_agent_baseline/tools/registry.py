@@ -54,8 +54,16 @@ _ANSWER_PARAMETERS: dict[str, Any] = {
             },
             "description": "Result rows; each row must have exactly len(columns) cells.",
         },
+        "evidence_step": {
+            "type": "integer",
+            "minimum": 1,
+            "description": (
+                "Step number of the successful tool observation that contains every value "
+                "submitted in this answer. Failed observations cannot be cited."
+            ),
+        },
     },
-    "required": ["columns", "rows"],
+    "required": ["columns", "rows", "evidence_step"],
 }
 
 
@@ -232,6 +240,7 @@ def create_default_tool_registry() -> ToolRegistry:
             input_schema={
                 "columns": ["column_name"],
                 "rows": [["value_1"]],
+                "evidence_step": 3,
             },
             parameters=_ANSWER_PARAMETERS,
         ),

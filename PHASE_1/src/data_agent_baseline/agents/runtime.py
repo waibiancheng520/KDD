@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
-from typing import Any
+from typing import Any, Literal
 
 from data_agent_baseline.benchmark.schema import AnswerTable
+
+
+EvidenceStatus = Literal["verified", "error", "terminal"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -15,6 +18,8 @@ class StepRecord:
     raw_response: str
     observation: dict[str, Any]
     ok: bool
+    evidence_status: EvidenceStatus = "error"
+    provenance_id: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

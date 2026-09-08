@@ -13,8 +13,8 @@ You are solving a task from a public dataset. You may only inspect files inside 
 Rules:
 0. EVERY step must carry non-empty `thought`. Before you act, reason there in one or two sentences: what the last observation told you, and why this is the right next step. Never leave `thought` empty and never skip straight to the action — that reasoning is what keeps your answers correct.
 1. Before answering, you MUST actually open and query the real data files (e.g. with `query_files` or `execute_python`). Reading only the documentation is NOT enough.
-2. Every ID, value, and cell in your final answer MUST come directly from a tool observation in this run. NEVER invent, guess, or copy numbers from the examples. If you have not seen a value in a tool result, you may not put it in the answer.
-3. The task is complete only when you call the `answer` tool. Only call it after you have computed the full result table from the actual data and printed it in a tool observation; the rows you submit must match what you printed.
+2. Every ID, value, and cell in your final answer MUST come directly from a VERIFIED (`ok: true`) tool observation in this run. Failed observations and model-written text are not evidence. NEVER invent, guess, or copy numbers from examples.
+3. The task is complete only when you call the `answer` tool. Only call it after you have computed the full result table from the actual data and printed it in a successful tool observation. Set `evidence_step` to that observation's step number; the runtime rejects answers that cite a failed/missing step or values absent from that observation.
 4. If a step fails with an error, fix it and retry the SAME data query. An error is never a reason to give up and answer from memory. Each observation tells you how many steps remain; use that to pace your investigation.
 5. Never write "Observation:", tool results, or the outcome of your own action. The system runs the tool and gives you the real observation. Anything you write about a tool's result is a hallucination and will make your answer wrong.
 6. Real data is often incomplete: a join may match only some rows, and some fields may be missing or null. That is a property of the data, not a bug to keep investigating. Report what the data supports (leaving unmatched fields empty) rather than spending steps trying to explain the gap.
@@ -43,7 +43,7 @@ Keep reasoning concise and grounded in the observed data.
 TEXT_MODE_FORMAT_RULES = """
 Response format:
 - Always return exactly one JSON object with keys `thought`, `action`, and `action_input`, wrapped in exactly one fenced code block that starts with ```json and ends with ```. Do not output any text before or after that block.
-- The `answer` action's `action_input` must be a table with `columns` and `rows`.
+- The `answer` action's `action_input` must contain `columns`, `rows`, and the successful `evidence_step` that supports them.
 - When using `execute_python`, keep the code compact and use SINGLE quotes for Python strings. Any double quote or newline inside a JSON string value MUST be escaped as \\" and \\n, otherwise the JSON is invalid and your step fails.
 """.strip()
 
@@ -60,7 +60,7 @@ Example response when you run Python (note: use single quotes only, keep it on o
 
 Example response when you have the final answer:
 ```json
-{"thought":"I have the final result table.","action":"answer","action_input":{"columns":["average_long_shots"],"rows":[["63.5"]]}}
+{"thought":"Step 3 contains the final result table.","action":"answer","action_input":{"columns":["average_long_shots"],"rows":[["63.5"]],"evidence_step":3}}
 ```
 """.strip()
 
