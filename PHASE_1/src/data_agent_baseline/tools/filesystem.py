@@ -66,22 +66,44 @@ def read_csv_preview(task: PublicTask, relative_path: str, *, max_rows: int = 20
     }
 
 
-def read_json_preview(task: PublicTask, relative_path: str, *, max_chars: int = 4000) -> dict[str, object]:
+def _window(text: str, relative_path: str, offset: int, max_chars: int) -> dict[str, object]:
+    """A slice of `text` plus the paging info needed to reach the rest of it.
+
+    Every knowledge.md in this dataset is larger than one window, and the section
+    that resolves column ambiguities sits at the end -- so a reader that cannot
+    page past the first window simply never sees it.
+    """
+    total = len(text)
+    start = max(0, min(offset, total))
+    end = min(start + max_chars, total)
+    result: dict[str, object] = {
+        "path": relative_path,
+        "preview": text[start:end],
+        "offset": start,
+        "next_offset": end if end < total else None,
+        "total_chars": total,
+        "truncated": end < total,
+    }
+    if end < total:
+        result["hint"] = (
+            f"{total - end} of {total} chars not shown. Call this tool again with "
+            f"offset={end} to continue reading."
+        )
+    return result
+
+
+def read_json_preview(
+    task: PublicTask, relative_path: str, *, max_chars: int = 8000, offset: int = 0
+) -> dict[str, object]:
     path = resolve_context_path(task, relative_path)
     payload = json.loads(path.read_text())
     preview = json.dumps(payload, ensure_ascii=False, indent=2)
-    return {
-        "path": relative_path,
-        "preview": preview[:max_chars],
-        "truncated": len(preview) > max_chars,
-    }
+    return _window(preview, relative_path, offset, max_chars)
 
 
-def read_doc_preview(task: PublicTask, relative_path: str, *, max_chars: int = 4000) -> dict[str, object]:
+def read_doc_preview(
+    task: PublicTask, relative_path: str, *, max_chars: int = 8000, offset: int = 0
+) -> dict[str, object]:
     path = resolve_context_path(task, relative_path)
     text = path.read_text(errors="replace")
-    return {
-        "path": relative_path,
-        "preview": text[:max_chars],
-        "truncated": len(text) > max_chars,
-    }
+    return _window(text, relative_path, offset, max_chars)

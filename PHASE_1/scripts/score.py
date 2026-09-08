@@ -80,6 +80,18 @@ def compare(gold: list[tuple[str, ...]], pred: list[tuple[str, ...]]) -> dict:
     }
 
 
+def _load_excluded_ids() -> set:
+    """Task ids whose knowledge.md contradicts the gold; see the config for evidence."""
+    config_path = Path(__file__).resolve().parent.parent / "configs" / "excluded_tasks.json"
+    if not config_path.is_file():
+        return set()
+    try:
+        payload = json.loads(config_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return set()
+    return {str(e["task_id"]) for e in payload.get("excluded", []) if isinstance(e, dict) and e.get("task_id")}
+
+
 def score_run(run_dir: Path, gold_root: Path) -> dict:
     results: list[dict] = []
 
@@ -122,12 +134,24 @@ def score_run(run_dir: Path, gold_root: Path) -> dict:
         entry.update(status="scored", **compare(gold, pred))
         results.append(entry)
 
+    excluded_ids = _load_excluded_ids()
+    for entry in results:
+        if entry["task_id"] in excluded_ids:
+            entry["excluded"] = True
+
     scored = [r for r in results if r["status"] == "scored"]
     correct = [r for r in scored if r["exact"]]
     total = len(results)
 
+    # 主口径排除"文档与 gold 矛盾"的题；同时保留全量口径，避免把问题藏起来。
+    kept = [r for r in results if not r.get("excluded")]
+    kept_correct = [r for r in kept if r.get("exact")]
+
     return {
         "run_dir": str(run_dir),
+        "excluded_tasks": sorted(excluded_ids & {r["task_id"] for r in results}),
+        "accuracy_all_tasks": round(len(correct) / total, 4) if total else 0.0,
+        "accuracy_excluding_known_bad": round(len(kept_correct) / len(kept), 4) if kept else 0.0,
         "total_tasks": total,
         "scored": len(scored),
         "no_prediction": sum(1 for r in results if r["status"] == "no_prediction"),
@@ -150,6 +174,10 @@ def _print_report(report: dict, verbose: bool) -> None:
         print(f"缺标准答案  : {report['no_gold']}")
     print(f"准确率      : {report['accuracy']:.1%}")
     print(f"平均行级F1  : {report['avg_f1']:.4f}")
+    if report.get("excluded_tasks"):
+        print(f"— 已排除(文档与gold矛盾): {', '.join(report['excluded_tasks'])}")
+        print(f"  排除后准确率: {report['accuracy_excluding_known_bad']:.1%}"
+              f"   (全量口径: {report['accuracy_all_tasks']:.1%})")
     print("=" * 68)
 
     for entry in report["tasks"]:

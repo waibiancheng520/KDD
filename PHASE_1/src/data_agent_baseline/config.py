@@ -28,6 +28,10 @@ class AgentConfig:
     api_key: str = ""
     max_steps: int = 16
     temperature: float = 0.0
+    # Native function calling is more robust about output format, but some models
+    # (DeepSeek among them) stop writing their reasoning once tools are enabled,
+    # which measurably lowers answer quality. Off by default; opt in per model.
+    native_tools: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -73,6 +77,7 @@ def load_app_config(config_path: Path) -> AppConfig:
         api_key=str(agent_payload.get("api_key", agent_defaults.api_key)),
         max_steps=int(agent_payload.get("max_steps", agent_defaults.max_steps)),
         temperature=float(agent_payload.get("temperature", agent_defaults.temperature)),
+        native_tools=bool(agent_payload.get("native_tools", agent_defaults.native_tools)),
     )
     raw_run_id = run_payload.get("run_id")
     run_id = run_defaults.run_id

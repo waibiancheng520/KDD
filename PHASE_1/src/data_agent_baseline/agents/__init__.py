@@ -6,6 +6,7 @@ from data_agent_baseline.agents.model import (
 )
 from data_agent_baseline.agents.prompt import (
     REACT_SYSTEM_PROMPT,
+    TEXT_MODE_FORMAT_RULES,
     build_observation_prompt,
     build_system_prompt,
     build_task_prompt,
@@ -21,6 +22,7 @@ __all__ = [
     "ModelStep",
     "OpenAIModelAdapter",
     "REACT_SYSTEM_PROMPT",
+    "TEXT_MODE_FORMAT_RULES",
     "ReActAgent",
     "ReActAgentConfig",
     "StepRecord",

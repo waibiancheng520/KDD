@@ -68,6 +68,7 @@ def build_model_adapter(config: AppConfig):
         api_base=config.agent.api_base,
         api_key=config.agent.api_key,
         temperature=config.agent.temperature,
+        native_tools=config.agent.native_tools,
     )
 
 
@@ -223,6 +224,29 @@ def run_single_task(
     return _write_task_outputs(task_id, run_output_dir, run_result)
 
 
+_EXCLUDED_TASKS_FILE = Path("configs/excluded_tasks.json")
+
+
+def load_excluded_task_ids(path: Path | None = None) -> set[str]:
+    """Task ids to skip: their own knowledge.md contradicts the published gold.
+
+    Keeping them in the queue spends API budget on tasks that cannot be won and
+    adds a constant offset to every run-to-run accuracy comparison.
+    """
+    config_path = path or _EXCLUDED_TASKS_FILE
+    if not config_path.is_file():
+        return set()
+    try:
+        payload = json.loads(config_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return set()
+    return {
+        str(entry["task_id"])
+        for entry in payload.get("excluded", [])
+        if isinstance(entry, dict) and entry.get("task_id")
+    }
+
+
 def run_benchmark(
     *,
     config: AppConfig,
@@ -235,6 +259,15 @@ def run_benchmark(
 
     dataset = DABenchPublicDataset(config.dataset.root_path)
     tasks = dataset.iter_tasks()
+    excluded = load_excluded_task_ids()
+    if excluded:
+        skipped = [task.task_id for task in tasks if task.task_id in excluded]
+        tasks = [task for task in tasks if task.task_id not in excluded]
+        if skipped:
+            print(
+                f"跳过 {len(skipped)} 个已知文档/gold 矛盾的任务: {', '.join(skipped)} "
+                f"(见 configs/excluded_tasks.json)"
+            )
     if limit is not None:
         tasks = tasks[:limit]
 
