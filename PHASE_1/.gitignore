@@ -34,6 +34,8 @@ artifacts/*
 # Local configs
 configs/*
 !configs/react_baseline.example.yaml
+# Machine-local benchmark settings; keep the API/model configuration untracked.
+configs/react_baseline.local.yaml
 
 # OS / notebook noise
 .DS_Store
